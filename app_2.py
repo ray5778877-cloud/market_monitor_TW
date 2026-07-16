@@ -124,7 +124,7 @@ UPSTREAM_VPMI_THRESHOLD   = 150.0
 DOWNSTREAM_VPMI_THRESHOLD =  80.0
 
 LOOKBACK_MONTHS     = 4
-LOOKBACK_MONTHS_CLOUD = 3  # 雲端縮短歷史，降低記憶體尖峰
+LOOKBACK_MONTHS_CLOUD = 2  # 雲端縮短歷史，降低記憶體尖峰
 MA_SHORT            = 20
 MA_LONG             = 50
 MOMENTUM_WINDOW     = 5
@@ -136,10 +136,50 @@ FVG_MAX_DISPLAY     = 6
 ALPHA_DELTA_SIGNAL  = 10.0
 DOWNLOAD_BATCH_SIZE = 7
 DOWNLOAD_RETRY_DELAY = 0.5
+# 免費 Streamlit Cloud 扛不住全宇宙 700+ 檔；雲端每產業最多 2 檔、總標的封頂
+CLOUD_TICKERS_PER_INDUSTRY = 2
+CLOUD_MAX_UNIQUE_TICKERS = 90
 
 
 def _effective_lookback_months() -> int:
     return LOOKBACK_MONTHS_CLOUD if IS_STREAMLIT_CLOUD else LOOKBACK_MONTHS
+
+
+def get_runtime_industries() -> dict[str, list[str]]:
+    """本機用完整 INDUSTRIES；雲端精簡成分股以符合免費版 RAM。"""
+    if not IS_STREAMLIT_CLOUD:
+        return INDUSTRIES
+
+    out: dict[str, list[str]] = {}
+    unique: set[str] = set()
+    for ind, tks in INDUSTRIES.items():
+        picked: list[str] = []
+        # 優先重用已選標的（產業重疊高，可大幅減少下載數）
+        for t in tks:
+            if t in unique and t not in picked:
+                picked.append(t)
+            if len(picked) >= CLOUD_TICKERS_PER_INDUSTRY:
+                break
+        if len(picked) < CLOUD_TICKERS_PER_INDUSTRY:
+            for t in tks:
+                if t in picked:
+                    continue
+                if t not in unique and len(unique) >= CLOUD_MAX_UNIQUE_TICKERS:
+                    continue
+                unique.add(t)
+                picked.append(t)
+                if len(picked) >= CLOUD_TICKERS_PER_INDUSTRY:
+                    break
+        if picked:
+            out[ind] = picked
+    return out
+
+
+def get_runtime_tickers(
+    industries: dict[str, list[str]] | None = None,
+) -> tuple[str, ...]:
+    inds = industries if industries is not None else get_runtime_industries()
+    return tuple(sorted({BENCHMARK, "^VIX"} | {t for tks in inds.values() for t in tks}))
 
 TIMEFRAME_OPTIONS = {
     "日線 (1D)":   {"period": "4mo", "interval": "1d"},
@@ -205,7 +245,7 @@ def _tw_code(sym: str) -> str:
 
 def _universe_tw_codes() -> set[str]:
     """戰情室實際用到的台股純數字代碼（用於精簡載入法人 CSV）。"""
-    return {_tw_code(t) for t in ALL_TICKERS if _is_tw_sym(t)}
+    return {_tw_code(t) for t in get_runtime_tickers() if _is_tw_sym(t)}
 
 
 def load_saved_holdings() -> list[str]:
@@ -1062,12 +1102,16 @@ def render_position_diagnostics(
     snapshot:   pd.DataFrame,
     aligned:    dict[str, pd.DataFrame],
     gate_slots: int,
+    industries: dict[str, list[str]] | None = None,
+    tickers: tuple[str, ...] | None = None,
 ) -> dict[str, int]:
     """持倉診斷；回傳 {'force': n, 'warn': n, 'hold': n} 供首屏摘要。"""
     st.subheader("🎯 實戰持倉即時診斷與動態換血雷達")
+    industries = industries if industries is not None else get_runtime_industries()
+    tickers = tickers if tickers is not None else get_runtime_tickers(industries)
 
     tradeable_opts = sorted([
-        t for t in ALL_TICKERS
+        t for t in tickers
         if t not in (BENCHMARK, "^VIX") and _is_tw_sym(t)
     ])
     init_holdings_state(tradeable_opts)
@@ -1097,7 +1141,7 @@ def render_position_diagnostics(
         return {"force": 0, "warn": 0, "hold": 0}
 
     ticker_to_ind: dict[str, str] = {}
-    for ind, tks in INDUSTRIES.items():
+    for ind, tks in industries.items():
         for tk in tks:
             if tk not in ticker_to_ind:
                 ticker_to_ind[tk] = ind
@@ -1120,7 +1164,7 @@ def render_position_diagnostics(
         st.metric("閘門允許最高槽位", f"{gate_slots} / 10",
                   "Alpha v11.2 VIX 動態水位", delta_color="off")
 
-    n_inds       = len(INDUSTRIES)
+    n_inds       = len(industries)
     gap_breakout = 6.0  + (n_inds / 5.0)
     gap_fallback = 12.0 + (n_inds / 5.0)
     st.caption(
@@ -1691,6 +1735,15 @@ def main() -> None:
     st.title("🧠 台灣科技產業鏈監控")
     st.caption("Alpha v11.2 NBR 籌碼大腦戰情室")
 
+    industries = get_runtime_industries()
+    runtime_tickers = get_runtime_tickers(industries)
+    if IS_STREAMLIT_CLOUD:
+        st.info(
+            f"☁️ 雲端精簡模式：下載 {len(runtime_tickers)} 檔標的"
+            f"（每產業最多 {CLOUD_TICKERS_PER_INDUSTRY} 檔，完整版請本機 "
+            f"`streamlit run app_2.py`）"
+        )
+
     # ── 資料載入 ────────────────────────────────────────────────────────
     with st.spinner("正在載入三大法人資料（歷史 CSV + 今日即時爬蟲）…"):
         net_buy_df = load_net_buy_data()
@@ -1703,9 +1756,11 @@ def main() -> None:
             "請執行 `python fetch_net_buy.py` 解鎖 NBR 全威力。"
         )
 
-    with st.spinner("正在分批抓取台灣股市行情數據（含 SOXX 基準）…"):
+    with st.spinner(
+        f"正在分批抓取行情（{len(runtime_tickers)} 檔，含 SOXX 基準）…"
+    ):
         try:
-            panels = fetch_market_data(ALL_TICKERS)
+            panels = fetch_market_data(runtime_tickers)
             calendar, aligned = align_panels(panels)
             del panels
             gc.collect()
@@ -1735,7 +1790,7 @@ def main() -> None:
 
     try:
         industry_metrics: dict[str, pd.DataFrame] = {}
-        for ind, tks in INDUSTRIES.items():
+        for ind, tks in industries.items():
             try:
                 industry_metrics[ind] = compute_industry_metrics(
                     ind, tks, aligned, net_buy_aligned
@@ -1748,18 +1803,21 @@ def main() -> None:
                 tks, aligned,
                 eq_cl=_top2_eq_close(industry_metrics[ind]) if ind in industry_metrics else None,
             )
-            for ind, tks in INDUSTRIES.items()
+            for ind, tks in industries.items()
         }
         rs_scores = {
             ind: compute_rs_slope(
                 tks, aligned,
                 eq_cl=_top2_eq_close(industry_metrics[ind]) if ind in industry_metrics else None,
             )
-            for ind, tks in INDUSTRIES.items()
+            for ind, tks in industries.items()
         }
 
         snapshot = latest_snapshot(industry_metrics, ma50_devs, rs_scores, aligned)
         snapshot = snapshot.sort_values("AlphaScore", ascending=False, na_position="last")
+        # 指標算完後釋放法人對齊序列，降低常駐 RAM
+        del net_buy_aligned
+        gc.collect()
     except Exception as exc:
         st.error(f"指標計算失敗：{exc}")
         return
@@ -1877,7 +1935,10 @@ def main() -> None:
     # 持倉診斷
     # ══════════════════════════════════════════════════════════════════
     elif nav == "持倉診斷":
-        render_position_diagnostics(snapshot, aligned, _gate_slots)
+        render_position_diagnostics(
+            snapshot, aligned, _gate_slots,
+            industries=industries, tickers=runtime_tickers,
+        )
 
     # ══════════════════════════════════════════════════════════════════
     # 產業掃描
@@ -1947,7 +2008,7 @@ def main() -> None:
     # ══════════════════════════════════════════════════════════════════
     elif nav == "個股研究":
         st.subheader("互動圖表 & SMC 個股分析")
-        ind_options = list(INDUSTRIES.keys())
+        ind_options = list(industries.keys())
         if "ind_sel" in st.session_state and st.session_state.ind_sel not in ind_options:
             st.session_state.ind_sel = ind_options[0]
 
@@ -1968,7 +2029,7 @@ def main() -> None:
         tf_cfg = TIMEFRAME_OPTIONS[timeframe]
 
         if view_mode == "📊 產業等權重 K 線":
-            chart_tickers = tuple(sorted(INDUSTRIES[selected]))
+            chart_tickers = tuple(sorted(industries[selected]))
             try:
                 with st.spinner(f"正在載入 {timeframe} 等權重數據…"):
                     chart_panels  = fetch_chart_data(chart_tickers, tf_cfg["period"], tf_cfg["interval"])
@@ -1989,7 +2050,7 @@ def main() -> None:
             except Exception as exc:
                 st.error(f"圖表繪製失敗：{exc}")
         else:
-            ind_tickers = INDUSTRIES[selected]
+            ind_tickers = industries[selected]
             top_stocks  = get_stock_momentum_scores(ind_tickers, aligned, TOP_STOCKS_N)
             st.markdown("#### 動能前 3 強個股（依 VPMI_5D 排序）")
             rank_cols = st.columns(max(len(top_stocks), 1))
