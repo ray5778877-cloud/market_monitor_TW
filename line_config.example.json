@@ -1,0 +1,9 @@
+{
+  "channel_access_token": "請填入 LINE Messaging API 的 Channel access token",
+  "user_id": "請填入你的 LINE User ID（U 開頭）",
+  "user_ids": [],
+  "send_mode": "broadcast",
+  "enabled": true,
+  "always_send_summary": true,
+  "comment": "send_mode: push=只寄給 user_id | multicast=寄給 user_id+user_ids | broadcast=寄給所有已加好友的人"
+}

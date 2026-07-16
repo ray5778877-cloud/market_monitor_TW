@@ -1,0 +1,11 @@
+data/line_config.json
+data/line_alert_state.json
+data/line_alert.log
+data/line_alert_task.log
+data/holdings.json
+data/latest_portfolio.json
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
