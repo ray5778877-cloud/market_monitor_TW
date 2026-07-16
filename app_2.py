@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import gc
 import json
 import os
 import time
@@ -18,6 +19,11 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 import yfinance as yf
+
+# Streamlit Cloud 路徑特徵：/mount/src/...（免費版約 1GB RAM）
+IS_STREAMLIT_CLOUD = os.path.isdir("/mount/src") or bool(
+    os.environ.get("STREAMLIT_RUNTIME_ENVIRONMENT") == "cloud"
+)
 
 # ---------------------------------------------------------------------------
 # 產業配置（上市 .TW / 上櫃 .TWO 後綴精確對齊，已剔除下市殭屍股）
@@ -118,6 +124,7 @@ UPSTREAM_VPMI_THRESHOLD   = 150.0
 DOWNSTREAM_VPMI_THRESHOLD =  80.0
 
 LOOKBACK_MONTHS     = 4
+LOOKBACK_MONTHS_CLOUD = 3  # 雲端縮短歷史，降低記憶體尖峰
 MA_SHORT            = 20
 MA_LONG             = 50
 MOMENTUM_WINDOW     = 5
@@ -129,6 +136,10 @@ FVG_MAX_DISPLAY     = 6
 ALPHA_DELTA_SIGNAL  = 10.0
 DOWNLOAD_BATCH_SIZE = 7
 DOWNLOAD_RETRY_DELAY = 0.5
+
+
+def _effective_lookback_months() -> int:
+    return LOOKBACK_MONTHS_CLOUD if IS_STREAMLIT_CLOUD else LOOKBACK_MONTHS
 
 TIMEFRAME_OPTIONS = {
     "日線 (1D)":   {"period": "4mo", "interval": "1d"},
@@ -152,8 +163,18 @@ SMC_SWING_N  = 5
 SMC_OB_MAX   = 5
 SMC_BOS_MAX  = 8
 TOP_STOCKS_N = 3
-NET_BUY_CSV  = "data/net_buy_shares.csv"
+NET_BUY_CSV_CANDIDATES = (
+    "data/net_buy_universe.csv",  # 精簡版（部署／雲端優先）
+    "data/net_buy_shares.csv",    # 全市場爬蟲原始檔（本機）
+)
 HOLDINGS_JSON = "data/holdings.json"
+
+
+def _resolve_net_buy_csv() -> str | None:
+    for path in NET_BUY_CSV_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
 
 NAV_OPTIONS = ("今日戰情", "持倉診斷", "產業掃描", "個股研究")
 
@@ -180,6 +201,11 @@ def _tw_code(sym: str) -> str:
     if sym.endswith(".TW"):  return sym[:-3]    # "2330.TW"  → "2330"
     if sym.endswith(".TWO"): return sym[:-4]    # "3105.TWO" → "3105"
     return sym
+
+
+def _universe_tw_codes() -> set[str]:
+    """戰情室實際用到的台股純數字代碼（用於精簡載入法人 CSV）。"""
+    return {_tw_code(t) for t in ALL_TICKERS if _is_tw_sym(t)}
 
 
 def load_saved_holdings() -> list[str]:
@@ -291,6 +317,12 @@ def _parse_batch(raw: pd.DataFrame, batch: list[str], *, with_volume_usd: bool) 
                 continue
             if with_volume_usd:
                 sub["Volume_USD"] = sub["Close"] * sub["Volume"] / fx_rate(sym)
+            keep = ["Open", "High", "Low", "Close", "Volume"]
+            if with_volume_usd and "Volume_USD" in sub.columns:
+                keep.append("Volume_USD")
+            sub = sub[keep]
+            for col in keep:
+                sub[col] = pd.to_numeric(sub[col], errors="coerce").astype(np.float32)
             result[sym] = sub
         except (KeyError, TypeError, ValueError):
             continue
@@ -376,22 +408,51 @@ def fetch_institutional_data(date_str: str) -> dict[str, float]:
     return {**tpex, **twse}
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=2)
 def load_net_buy_data() -> pd.DataFrame | None:
     """
     載入歷史三大法人淨買超 CSV，並嘗試以今日即時爬蟲補齊最新一天。
     CSV 格式：index=Date(UTC)，columns=純數字代碼（如 "2330"）
+
+    記憶體優化：只讀戰情室 universe 用到的欄位 + 近幾個月列，避免
+    全市場 6 萬欄 CSV 在 Streamlit Cloud 爆 RAM。
     """
     df: pd.DataFrame = pd.DataFrame()
+    needed = _universe_tw_codes()
+    csv_path = _resolve_net_buy_csv()
 
-    if os.path.exists(NET_BUY_CSV):
+    if csv_path is not None:
         try:
-            df = pd.read_csv(NET_BUY_CSV, index_col=0, parse_dates=True)
+            header = pd.read_csv(csv_path, nrows=0)
+            cols = list(header.columns)
+            if not cols:
+                raise ValueError("empty net_buy csv header")
+            date_col = cols[0]
+            keep_codes = [c for c in cols[1:] if str(c) in needed]
+            usecols = [date_col] + keep_codes
+            df = pd.read_csv(
+                csv_path,
+                index_col=0,
+                parse_dates=True,
+                usecols=usecols,
+            )
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
             else:
                 df.index = df.index.tz_convert("UTC")
             df = df.sort_index()
+            keep_days = _effective_lookback_months() * 31 + MA_LONG + 40
+            cutoff = pd.Timestamp(
+                dt.date.today() - dt.timedelta(days=keep_days), tz="UTC"
+            )
+            trimmed = df.loc[df.index >= cutoff]
+            # CSV 若落後「今天」過久，改從資料最後一日往回截，避免被裁成空表
+            if trimmed.empty and not df.empty:
+                end = df.index.max()
+                trimmed = df.loc[df.index >= (end - pd.Timedelta(days=keep_days))]
+            df = trimmed
+            if not df.empty:
+                df = df.apply(pd.to_numeric, errors="coerce").astype(np.float32)
         except Exception:
             df = pd.DataFrame()
 
@@ -401,8 +462,10 @@ def load_net_buy_data() -> pd.DataFrame | None:
     if df.empty or today_ts not in df.index:
         today_data = fetch_institutional_data(today_str)
         if today_data:
-            row_df = pd.DataFrame([today_data], index=[today_ts])
-            df = pd.concat([df, row_df]).sort_index() if not df.empty else row_df
+            slim = {k: v for k, v in today_data.items() if str(k) in needed}
+            if slim:
+                row_df = pd.DataFrame([slim], index=[today_ts]).astype(np.float32)
+                df = pd.concat([df, row_df]).sort_index() if not df.empty else row_df
 
     return df if not df.empty else None
 
@@ -443,12 +506,13 @@ def build_net_buy_aligned(
 # ---------------------------------------------------------------------------
 # 數據抓取
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=2)
 def fetch_market_data(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
     end   = dt.date.today()
-    start = end - dt.timedelta(days=LOOKBACK_MONTHS * 31 + MA_LONG + 10)
+    start = end - dt.timedelta(days=_effective_lookback_months() * 31 + MA_LONG + 10)
     s_str = start.isoformat()
     e_str = (end + dt.timedelta(days=1)).isoformat()
+    use_threads = not IS_STREAMLIT_CLOUD  # 雲端關 multithread，降低記憶體尖峰
 
     ticker_list = list(tickers)
     batches = [ticker_list[i: i + DOWNLOAD_BATCH_SIZE]
@@ -460,10 +524,11 @@ def fetch_market_data(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
             raw = yf.download(
                 batch, start=s_str, end=e_str,
                 interval="1d", group_by="ticker",
-                auto_adjust=True, progress=False, threads=True,
+                auto_adjust=True, progress=False, threads=use_threads,
             )
             if raw is not None and not raw.empty:
                 result.update(_parse_batch(raw, batch, with_volume_usd=True))
+            del raw
         except Exception:
             pass
 
@@ -473,15 +538,18 @@ def fetch_market_data(tickers: tuple[str, ...]) -> dict[str, pd.DataFrame]:
                 raw_s = yf.download(
                     sym, start=s_str, end=e_str,
                     interval="1d", auto_adjust=True, progress=False,
+                    threads=False,
                 )
                 if raw_s is not None and not raw_s.empty:
                     result.update(_parse_batch(raw_s, [sym], with_volume_usd=True))
+                del raw_s
             except Exception:
                 pass
         time.sleep(DOWNLOAD_RETRY_DELAY)
 
     if not result:
         raise ValueError("所有標的均無有效數據。")
+    gc.collect()
     return result
 
 
@@ -1614,8 +1682,10 @@ def main() -> None:
         st.divider()
         with st.expander("關於本系統", expanded=False):
             st.caption(
-                f"yfinance + TWSE/TPEx 三大法人 · 近 {LOOKBACK_MONTHS} 個月日線 · "
-                f"基準 {BENCHMARK} · TWD={USD_TWD} · .TW/.TWO 雙後綴已對齊"
+                f"yfinance + TWSE/TPEx 三大法人 · 近 {_effective_lookback_months()} 個月日線 · "
+                f"基準 {BENCHMARK} · TWD={USD_TWD} · "
+                f"{'Cloud 省記憶體模式 · ' if IS_STREAMLIT_CLOUD else ''}"
+                f".TW/.TWO 雙後綴已對齊"
             )
 
     st.title("🧠 台灣科技產業鏈監控")
@@ -1628,14 +1698,17 @@ def main() -> None:
     nbr_on = net_buy_df is not None
     if not nbr_on:
         st.warning(
-            f"⚠️ 找不到 `{NET_BUY_CSV}`，以量能方向近似替代法人籌碼。"
-            f"請執行 `python fetch_net_buy.py` 解鎖 NBR 全威力。"
+            "⚠️ 找不到法人淨買超 CSV（`data/net_buy_universe.csv` 或 "
+            "`data/net_buy_shares.csv`），以量能方向近似替代法人籌碼。"
+            "請執行 `python fetch_net_buy.py` 解鎖 NBR 全威力。"
         )
 
     with st.spinner("正在分批抓取台灣股市行情數據（含 SOXX 基準）…"):
         try:
             panels = fetch_market_data(ALL_TICKERS)
             calendar, aligned = align_panels(panels)
+            del panels
+            gc.collect()
         except Exception as exc:
             st.error(f"數據獲取失敗：{exc}")
             return
@@ -1651,8 +1724,12 @@ def main() -> None:
         try:
             nb_reindexed = net_buy_df.reindex(calendar).ffill().fillna(0)
             net_buy_aligned = build_net_buy_aligned(aligned, nb_reindexed)
+            del nb_reindexed
         except Exception:
             net_buy_aligned = build_net_buy_aligned(aligned, None)
+        # cache 仍保留 net_buy_df；此處釋放本輪多餘引用
+        net_buy_df = None
+        gc.collect()
     else:
         net_buy_aligned = build_net_buy_aligned(aligned, None)
 

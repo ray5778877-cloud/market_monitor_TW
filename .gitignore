@@ -11,5 +11,5 @@ __pycache__/
 venv/
 .tools/
 
-# 若 CSV 太大無法推 GitHub，取消下一行註解：
-# data/net_buy_shares.csv
+# 全市場原始法人檔太大（~38MB / 6萬欄），雲端改用 data/net_buy_universe.csv
+data/net_buy_shares.csv
