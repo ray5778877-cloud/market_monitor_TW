@@ -13,3 +13,4 @@ venv/
 
 # 全市場原始法人檔太大（~38MB / 6萬欄），雲端改用 data/net_buy_universe.csv
 data/net_buy_shares.csv
+data/cache/

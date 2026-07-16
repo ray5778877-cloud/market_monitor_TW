@@ -12,6 +12,7 @@ import gc
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -124,7 +125,7 @@ UPSTREAM_VPMI_THRESHOLD   = 150.0
 DOWNSTREAM_VPMI_THRESHOLD =  80.0
 
 LOOKBACK_MONTHS     = 4
-LOOKBACK_MONTHS_CLOUD = 2  # 雲端縮短歷史，降低記憶體尖峰
+LOOKBACK_MONTHS_CLOUD = 3  # 雲端略縮歷史；完整標的池靠磁碟快取撐住
 MA_SHORT            = 20
 MA_LONG             = 50
 MOMENTUM_WINDOW     = 5
@@ -136,9 +137,10 @@ FVG_MAX_DISPLAY     = 6
 ALPHA_DELTA_SIGNAL  = 10.0
 DOWNLOAD_BATCH_SIZE = 7
 DOWNLOAD_RETRY_DELAY = 0.5
-# 免費 Streamlit Cloud 扛不住全宇宙 700+ 檔；雲端每產業最多 2 檔、總標的封頂
+# 僅當明確設 FORCE_CLOUD_LITE=1 才砍標的；預設保留完整 700+ 檔
 CLOUD_TICKERS_PER_INDUSTRY = 2
 CLOUD_MAX_UNIQUE_TICKERS = 90
+OHLCV_CACHE_ROOT = Path("data/cache/ohlcv")
 
 
 def _effective_lookback_months() -> int:
@@ -146,15 +148,14 @@ def _effective_lookback_months() -> int:
 
 
 def get_runtime_industries() -> dict[str, list[str]]:
-    """本機用完整 INDUSTRIES；雲端精簡成分股以符合免費版 RAM。"""
-    if not IS_STREAMLIT_CLOUD:
+    """預設完整 INDUSTRIES；只有 FORCE_CLOUD_LITE=1 才精簡。"""
+    if os.environ.get("FORCE_CLOUD_LITE", "").strip() != "1":
         return INDUSTRIES
 
     out: dict[str, list[str]] = {}
     unique: set[str] = set()
     for ind, tks in INDUSTRIES.items():
         picked: list[str] = []
-        # 優先重用已選標的（產業重疊高，可大幅減少下載數）
         for t in tks:
             if t in unique and t not in picked:
                 picked.append(t)
@@ -295,6 +296,237 @@ def clear_data_caches() -> None:
         st.cache_data.clear()
     except Exception:
         pass
+    try:
+        if OHLCV_CACHE_ROOT.exists():
+            for p in OHLCV_CACHE_ROOT.rglob("*"):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _ohlcv_stamp() -> str:
+    return f"{dt.date.today().isoformat()}_lb{_effective_lookback_months()}"
+
+
+def _safe_ticker_filename(sym: str) -> str:
+    return sym.replace("^", "_IDX_").replace("/", "_").replace("\\", "_")
+
+
+def _ticker_cache_path(sym: str, stamp: str | None = None) -> Path:
+    stamp = stamp or _ohlcv_stamp()
+    return OHLCV_CACHE_ROOT / stamp / f"{_safe_ticker_filename(sym)}.pkl"
+
+
+def _metrics_cache_path(industry: str, stamp: str | None = None) -> Path:
+    stamp = stamp or _ohlcv_stamp()
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in industry)
+    return OHLCV_CACHE_ROOT / stamp / f"metrics_{safe}.pkl"
+
+
+def save_ticker_ohlcv(sym: str, df: pd.DataFrame, stamp: str | None = None) -> None:
+    path = _ticker_cache_path(sym, stamp)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_pickle(path)
+
+
+def load_ticker_ohlcv(sym: str, stamp: str | None = None) -> pd.DataFrame | None:
+    path = _ticker_cache_path(sym, stamp)
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_pickle(path)
+        return df if isinstance(df, pd.DataFrame) and not df.empty else None
+    except Exception:
+        return None
+
+
+def load_tickers_from_disk(
+    tickers: list[str] | tuple[str, ...],
+    stamp: str | None = None,
+) -> dict[str, pd.DataFrame]:
+    out: dict[str, pd.DataFrame] = {}
+    for sym in tickers:
+        df = load_ticker_ohlcv(sym, stamp)
+        if df is not None:
+            out[sym] = df
+    return out
+
+
+def ensure_ohlcv_disk_cache(
+    tickers: tuple[str, ...],
+    *,
+    progress_bar=None,
+) -> str:
+    """分批下載缺漏標的並立刻寫入磁碟，避免 700+ DataFrame 同時留在 RAM。"""
+    stamp = _ohlcv_stamp()
+    OHLCV_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for child in OHLCV_CACHE_ROOT.iterdir():
+            if child.is_dir() and child.name != stamp:
+                for f in child.glob("*"):
+                    f.unlink(missing_ok=True)
+                try:
+                    child.rmdir()
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+    missing = [t for t in tickers if not _ticker_cache_path(t, stamp).exists()]
+    if not missing:
+        return stamp
+
+    end = dt.date.today()
+    start = end - dt.timedelta(days=_effective_lookback_months() * 31 + MA_LONG + 10)
+    s_str = start.isoformat()
+    e_str = (end + dt.timedelta(days=1)).isoformat()
+    use_threads = not IS_STREAMLIT_CLOUD
+    batches = [
+        missing[i: i + DOWNLOAD_BATCH_SIZE]
+        for i in range(0, len(missing), DOWNLOAD_BATCH_SIZE)
+    ]
+    total = max(len(batches), 1)
+
+    for bi, batch in enumerate(batches):
+        if progress_bar is not None:
+            progress_bar.progress(
+                (bi + 1) / total,
+                text=f"下載行情寫入磁碟 {bi + 1}/{total}（本批 {len(batch)} 檔）",
+            )
+        try:
+            raw = yf.download(
+                batch, start=s_str, end=e_str,
+                interval="1d", group_by="ticker",
+                auto_adjust=True, progress=False, threads=use_threads,
+            )
+            parsed = (
+                _parse_batch(raw, batch, with_volume_usd=True)
+                if raw is not None and not raw.empty else {}
+            )
+            del raw
+            for sym, df in parsed.items():
+                save_ticker_ohlcv(sym, df, stamp)
+            del parsed
+        except Exception:
+            pass
+
+        still = [s for s in batch if not _ticker_cache_path(s, stamp).exists()]
+        for sym in still:
+            try:
+                raw_s = yf.download(
+                    sym, start=s_str, end=e_str,
+                    interval="1d", auto_adjust=True, progress=False, threads=False,
+                )
+                parsed_s = (
+                    _parse_batch(raw_s, [sym], with_volume_usd=True)
+                    if raw_s is not None and not raw_s.empty else {}
+                )
+                del raw_s
+                for s2, df2 in parsed_s.items():
+                    save_ticker_ohlcv(s2, df2, stamp)
+                del parsed_s
+            except Exception:
+                pass
+        gc.collect()
+        time.sleep(DOWNLOAD_RETRY_DELAY)
+
+    return stamp
+
+
+def build_net_buy_for_tickers(
+    tickers: list[str],
+    aligned: dict[str, pd.DataFrame],
+    net_buy_df: pd.DataFrame | None,
+) -> dict[str, pd.Series]:
+    subset = {t: aligned[t] for t in tickers if t in aligned}
+    return build_net_buy_aligned(subset, net_buy_df)
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
+def build_war_room_bundle(
+    tickers: tuple[str, ...],
+    industry_items: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[pd.DataFrame, float | None, float, str]:
+    """
+    完整標的池戰情計算（記憶體友善）：
+    行情落盤 → 逐產業載入計算釋放 → 只快取 snapshot + 純量。
+    """
+    stamp = ensure_ohlcv_disk_cache(tickers)
+    net_buy_df = load_net_buy_data()
+
+    industry_metrics: dict[str, pd.DataFrame] = {}
+    ma50_devs: dict[str, float] = {}
+    rs_scores: dict[str, float] = {}
+    bench_panel = load_tickers_from_disk([BENCHMARK, "^VIX"], stamp)
+
+    for ind, tks in industry_items:
+        tks_list = list(tks)
+        need = list(dict.fromkeys([*tks_list, BENCHMARK]))
+        aligned = load_tickers_from_disk(need, stamp)
+        if BENCHMARK in bench_panel and BENCHMARK not in aligned:
+            aligned[BENCHMARK] = bench_panel[BENCHMARK]
+        if not any(t in aligned for t in tks_list):
+            del aligned
+            continue
+        try:
+            nb_aligned = build_net_buy_for_tickers(tks_list, aligned, net_buy_df)
+            im = compute_industry_metrics(ind, tks_list, aligned, nb_aligned)
+            industry_metrics[ind] = im
+            eq_cl = _top2_eq_close(im)
+            ma50_devs[ind] = compute_ma50_dev(tks_list, aligned, eq_cl=eq_cl)
+            rs_scores[ind] = compute_rs_slope(tks_list, aligned, eq_cl=eq_cl)
+            try:
+                _metrics_cache_path(ind, stamp).parent.mkdir(parents=True, exist_ok=True)
+                im.to_pickle(_metrics_cache_path(ind, stamp))
+            except Exception:
+                pass
+            del nb_aligned, im, eq_cl
+        except ValueError:
+            pass
+        del aligned
+        gc.collect()
+
+    snapshot = latest_snapshot(industry_metrics, ma50_devs, rs_scores, {})
+    snapshot = snapshot.sort_values("AlphaScore", ascending=False, na_position="last")
+
+    vix_today: float | None = None
+    vix_df = bench_panel.get("^VIX")
+    if vix_df is not None and "Close" in vix_df.columns:
+        vix_close = vix_df["Close"].dropna()
+        if not vix_close.empty:
+            vix_today = float(vix_close.iloc[-1])
+
+    _alpha_proxy = {
+        ind: industry_metrics[ind]["VPMI_5D"].fillna(0.0)
+        for ind in industry_metrics
+        if "VPMI_5D" in industry_metrics[ind].columns
+    }
+    all_alpha_df = pd.DataFrame(_alpha_proxy).ffill() if _alpha_proxy else pd.DataFrame()
+    if not all_alpha_df.empty and len(all_alpha_df) >= 6:
+        _daily_b = (all_alpha_df.diff() > 0).sum(axis=1) / max(all_alpha_df.shape[1], 1)
+        _b5d = _daily_b.rolling(5, min_periods=1).mean()
+        breadth = float(
+            (_b5d.rolling(20, min_periods=5).rank(pct=True) * 100).clip(0.0, 100.0).iloc[-1]
+        )
+    else:
+        breadth = 50.0
+
+    del industry_metrics, ma50_devs, rs_scores, all_alpha_df, bench_panel, net_buy_df
+    gc.collect()
+    return snapshot, vix_today, breadth, stamp
+
+
+def load_industry_metrics_cached(industry: str, stamp: str) -> pd.DataFrame | None:
+    path = _metrics_cache_path(industry, stamp)
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_pickle(path)
+        return df if isinstance(df, pd.DataFrame) and not df.empty else None
+    except Exception:
+        return None
 
 
 def clamp_taiwan_volume(
@@ -1737,114 +1969,55 @@ def main() -> None:
 
     industries = get_runtime_industries()
     runtime_tickers = get_runtime_tickers(industries)
+    industry_items = tuple((k, tuple(v)) for k, v in industries.items())
+    lite_on = os.environ.get("FORCE_CLOUD_LITE", "").strip() == "1"
     if IS_STREAMLIT_CLOUD:
         st.info(
-            f"☁️ 雲端精簡模式：下載 {len(runtime_tickers)} 檔標的"
-            f"（每產業最多 {CLOUD_TICKERS_PER_INDUSTRY} 檔，完整版請本機 "
-            f"`streamlit run app_2.py`）"
+            f"☁️ 雲端完整標的池：{len(runtime_tickers)} 檔"
+            f"（行情寫入磁碟、戰情只常駐 snapshot"
+            + ("；目前 FORCE_CLOUD_LITE=1" if lite_on else "")
+            + "）"
         )
 
-    # ── 資料載入 ────────────────────────────────────────────────────────
-    with st.spinner("正在載入三大法人資料（歷史 CSV + 今日即時爬蟲）…"):
-        net_buy_df = load_net_buy_data()
+    # ── 資料載入（磁碟快取 + 只快取 snapshot，避免 700+ DataFrame 爆 RAM）──
+    prog = st.progress(0, text="準備下載／載入行情…")
+    try:
+        # 先確保磁碟有資料（有進度條）；bundle 內若已齊會秒過
+        ensure_ohlcv_disk_cache(runtime_tickers, progress_bar=prog)
+        snapshot, _vix_today, _breadth, cache_stamp = build_war_room_bundle(
+            runtime_tickers, industry_items,
+        )
+    except Exception as exc:
+        prog.empty()
+        st.error(f"數據獲取／指標計算失敗：{exc}")
+        return
+    prog.empty()
 
-    nbr_on = net_buy_df is not None
+    nbr_path = _resolve_net_buy_csv()
+    nbr_on = nbr_path is not None
     if not nbr_on:
         st.warning(
             "⚠️ 找不到法人淨買超 CSV（`data/net_buy_universe.csv` 或 "
             "`data/net_buy_shares.csv`），以量能方向近似替代法人籌碼。"
-            "請執行 `python fetch_net_buy.py` 解鎖 NBR 全威力。"
         )
-
-    with st.spinner(
-        f"正在分批抓取行情（{len(runtime_tickers)} 檔，含 SOXX 基準）…"
-    ):
+    nbr_latest = "—"
+    if nbr_on:
         try:
-            panels = fetch_market_data(runtime_tickers)
-            calendar, aligned = align_panels(panels)
-            del panels
-            gc.collect()
-        except Exception as exc:
-            st.error(f"數據獲取失敗：{exc}")
-            return
+            _nb_peek = pd.read_csv(nbr_path, index_col=0, parse_dates=True, usecols=[0])
+            if len(_nb_peek):
+                nbr_latest = str(pd.Timestamp(_nb_peek.index.max()).date())
+            del _nb_peek
+        except Exception:
+            nbr_latest = "CSV"
 
     st.session_state["data_loaded_at"] = dt.datetime.now().strftime("%H:%M:%S")
+    st.session_state["ohlcv_stamp"] = cache_stamp
     data_ts = st.session_state["data_loaded_at"]
-    nbr_latest = (
-        str(net_buy_df.index[-1].date()) if nbr_on and len(net_buy_df) else "—"
-    )
 
-    net_buy_aligned: dict[str, pd.Series] | None = None
-    if net_buy_df is not None:
-        try:
-            nb_reindexed = net_buy_df.reindex(calendar).ffill().fillna(0)
-            net_buy_aligned = build_net_buy_aligned(aligned, nb_reindexed)
-            del nb_reindexed
-        except Exception:
-            net_buy_aligned = build_net_buy_aligned(aligned, None)
-        # cache 仍保留 net_buy_df；此處釋放本輪多餘引用
-        net_buy_df = None
-        gc.collect()
-    else:
-        net_buy_aligned = build_net_buy_aligned(aligned, None)
-
-    try:
-        industry_metrics: dict[str, pd.DataFrame] = {}
-        for ind, tks in industries.items():
-            try:
-                industry_metrics[ind] = compute_industry_metrics(
-                    ind, tks, aligned, net_buy_aligned
-                )
-            except ValueError:
-                pass
-
-        ma50_devs = {
-            ind: compute_ma50_dev(
-                tks, aligned,
-                eq_cl=_top2_eq_close(industry_metrics[ind]) if ind in industry_metrics else None,
-            )
-            for ind, tks in industries.items()
-        }
-        rs_scores = {
-            ind: compute_rs_slope(
-                tks, aligned,
-                eq_cl=_top2_eq_close(industry_metrics[ind]) if ind in industry_metrics else None,
-            )
-            for ind, tks in industries.items()
-        }
-
-        snapshot = latest_snapshot(industry_metrics, ma50_devs, rs_scores, aligned)
-        snapshot = snapshot.sort_values("AlphaScore", ascending=False, na_position="last")
-        # 指標算完後釋放法人對齊序列，降低常駐 RAM
-        del net_buy_aligned
-        gc.collect()
-    except Exception as exc:
-        st.error(f"指標計算失敗：{exc}")
-        return
-
-    _vix_today: float | None = None
-    _vix_df = aligned.get("^VIX")
-    if _vix_df is not None and "Close" in _vix_df.columns:
-        _vix_close = _vix_df["Close"].dropna()
-        if not _vix_close.empty:
-            _vix_today = float(_vix_close.iloc[-1])
-
-    _alpha_proxy = {
-        ind: industry_metrics[ind]["VPMI_5D"].fillna(0.0)
-        for ind in industry_metrics if "VPMI_5D" in industry_metrics[ind].columns
-    }
-    all_alpha_df = pd.DataFrame(_alpha_proxy).ffill() if _alpha_proxy else pd.DataFrame()
-
-    if not all_alpha_df.empty and len(all_alpha_df) >= 6:
-        _daily_b = (all_alpha_df.diff() > 0).sum(axis=1) / max(all_alpha_df.shape[1], 1)
-        _b5d     = _daily_b.rolling(5, min_periods=1).mean()
-        _breadth = float(
-            (_b5d.rolling(20, min_periods=5).rank(pct=True) * 100).clip(0.0, 100.0).iloc[-1]
-        )
-    else:
-        _breadth = 50.0
-
-    _n_industries = max(len(industry_metrics), 1)
+    # 頁面按需載入：預設不常駐全市場 aligned / industry_metrics
+    aligned: dict[str, pd.DataFrame] = {}
+    industry_metrics: dict[str, pd.DataFrame] = {}
+    _n_industries = max(len(snapshot), 1) if snapshot is not None else 1
 
     if _vix_today is not None and _vix_today < 22.0:
         _gate_slots = 10
@@ -1935,10 +2108,16 @@ def main() -> None:
     # 持倉診斷
     # ══════════════════════════════════════════════════════════════════
     elif nav == "持倉診斷":
+        # 只載入目前持股相關行情，不把 700+ 檔拉回 RAM
+        held = list(st.session_state.get("holdings", load_saved_holdings()))
+        need = list(dict.fromkeys([*held, BENCHMARK]))
+        aligned = load_tickers_from_disk(need, cache_stamp)
         render_position_diagnostics(
             snapshot, aligned, _gate_slots,
             industries=industries, tickers=runtime_tickers,
         )
+        del aligned
+        gc.collect()
 
     # ══════════════════════════════════════════════════════════════════
     # 產業掃描
@@ -2028,12 +2207,26 @@ def main() -> None:
         )
         tf_cfg = TIMEFRAME_OPTIONS[timeframe]
 
+        # 只載入此產業成分股
+        ind_tickers = industries[selected]
+        aligned = load_tickers_from_disk(
+            list(dict.fromkeys([*ind_tickers, BENCHMARK])), cache_stamp
+        )
+        im_sel = load_industry_metrics_cached(selected, cache_stamp)
+        if im_sel is not None:
+            industry_metrics[selected] = im_sel
+
         if view_mode == "📊 產業等權重 K 線":
-            chart_tickers = tuple(sorted(industries[selected]))
+            chart_tickers = tuple(sorted(ind_tickers))
             try:
                 with st.spinner(f"正在載入 {timeframe} 等權重數據…"):
-                    chart_panels  = fetch_chart_data(chart_tickers, tf_cfg["period"], tf_cfg["interval"])
-                    chart_aligned = align_panels_utc(chart_panels)
+                    if tf_cfg["interval"] == "1d" and all(t in aligned for t in chart_tickers):
+                        chart_aligned = aligned
+                    else:
+                        chart_panels = fetch_chart_data(
+                            chart_tickers, tf_cfg["period"], tf_cfg["interval"]
+                        )
+                        chart_aligned = align_panels_utc(chart_panels)
                     ohlc = build_equal_weight_ohlc(
                         list(chart_tickers), chart_aligned,
                         filter_empty_bars=(tf_cfg["interval"] == "1h"),
@@ -2050,7 +2243,6 @@ def main() -> None:
             except Exception as exc:
                 st.error(f"圖表繪製失敗：{exc}")
         else:
-            ind_tickers = industries[selected]
             top_stocks  = get_stock_momentum_scores(ind_tickers, aligned, TOP_STOCKS_N)
             st.markdown("#### 動能前 3 強個股（依 VPMI_5D 排序）")
             rank_cols = st.columns(max(len(top_stocks), 1))
@@ -2116,6 +2308,9 @@ def main() -> None:
                         "🟢 <b>Entry ▲</b>：BOS 後回測 OB/FVG 進場機會"
                         "</div>", unsafe_allow_html=True,
                     )
+
+        del aligned
+        gc.collect()
 
     print(
         "\n  ✅ UI 優化版戰情室就緒！"
