@@ -9,3 +9,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.tools/
+
+# 若 CSV 太大無法推 GitHub，取消下一行註解：
+# data/net_buy_shares.csv

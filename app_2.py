@@ -1208,9 +1208,7 @@ def render_sniper_scanner(snapshot: pd.DataFrame) -> None:
                 unsafe_allow_html=True,
             )
             if st.button("研究此產業 →", key=f"snip_jump_{rank}", use_container_width=True):
-                st.session_state["ind_sel"] = ind_name
-                st.session_state["nav"] = "個股研究"
-                st.rerun()
+                _jump_to_industry_research(ind_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1570,6 +1568,21 @@ def style_metrics_table(df: pd.DataFrame) -> "pd.io.formats.style.Styler":
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
+def _apply_pending_navigation() -> None:
+    """在綁定 key 的 widget 建立前，套用延遲導航（避免 StreamlitAPIException）。"""
+    if "pending_nav" in st.session_state:
+        st.session_state.nav = st.session_state.pop("pending_nav")
+    if "pending_ind_sel" in st.session_state:
+        st.session_state.ind_sel = st.session_state.pop("pending_ind_sel")
+
+
+def _jump_to_industry_research(ind_name: str) -> None:
+    """跳到「個股研究」並預選產業（下一輪 rerun 才寫入 widget key）。"""
+    st.session_state["pending_ind_sel"] = ind_name
+    st.session_state["pending_nav"] = "個股研究"
+    st.rerun()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="台灣產業鏈監控 v11.2 · NBR 籌碼大腦",
@@ -1580,6 +1593,7 @@ def main() -> None:
 
     if "nav" not in st.session_state:
         st.session_state.nav = "今日戰情"
+    _apply_pending_navigation()
 
     # ── 側邊欄：重新整理 / 資料狀態 ─────────────────────────────────────
     with st.sidebar:
@@ -1849,9 +1863,7 @@ def main() -> None:
         if jump_inds:
             jump = st.selectbox("快速跳到個股研究", options=["—"] + jump_inds, key="scan_jump")
             if jump != "—" and st.button("前往研究此產業 →", key="scan_jump_btn"):
-                st.session_state["ind_sel"] = jump
-                st.session_state["nav"] = "個股研究"
-                st.rerun()
+                _jump_to_industry_research(jump)
 
     # ══════════════════════════════════════════════════════════════════
     # 個股研究

@@ -182,7 +182,20 @@ Start-ScheduledTask -TaskName MarketMonitorTW_LineAlert_0830
 
 ---
 
-## 11. 給新電腦 Cursor Agent 的貼上用提示
+## 11. 部署成公開網站（Streamlit Cloud）
+
+詳細步驟見專案根目錄 **`DEPLOY.md`**。
+
+摘要：
+1. 推上 GitHub（勿上傳 `line_config.json`）
+2. https://share.streamlit.io → New app → Main file = `app_2.py`
+3. 得到 `https://xxxx.streamlit.app` 即為公開戰情室
+
+本機 08:30 LINE 排程與雲端網站互不影響。
+
+---
+
+## 12. 給新電腦 Cursor Agent 的貼上用提示
 
 把下面整段貼給新電腦的 Agent：
 
